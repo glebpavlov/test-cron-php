@@ -1,175 +1,208 @@
 <?php
 
-class CronTimer {
+class CronTimer
+{
+    /**
+     * Находит ближайшее будущее время, соответствующее критериям.
+     *
+     * @param array $params Ассоциативный массив критериев времени.
+     * @param string|null $currentTime Текущая дата и время в формате "дд.мм.гггг чч:мм:сс" (необязательный параметр).
+     * @return string|false Время в формате "дд.мм.гггг чч:мм:сс" или false, если подходящее время не найдено.
+     */
+    public static function nextTime($params = [], $currentTime = null)
+    {
+        // Нормализуем параметры
+        $params = self::normalizeParams($params);
 
-    // Основная функция для нахождения следующего времени по заданным критериям
-    public static function nextTime($params = [], $currentTime = null) {
-        // Если текущее время не указано, используем системное время
-        if ($currentTime === null) {
-            $currentTime = date("d.m.Y H:i:s");
-        }
-
-        // Преобразуем строку текущего времени в объект DateTime
-        $current = DateTime::createFromFormat("d.m.Y H:i:s", $currentTime);
+        // Устанавливаем текущее время
+        $current = $currentTime ? DateTime::createFromFormat('d.m.Y H:i:s', $currentTime) : new DateTime();
         if (!$current) {
-            throw new InvalidArgumentException("Invalid date format: $currentTime");
+            return false;
         }
 
-        // Приводим параметры к стандартному виду
-        $criteria = self::normalizeParams($params);
-
-        // Сразу увеличиваем текущее время на одну секунду, чтобы начать поиск с будущего времени
-        $current->modify('+1 second');
-
-        // Проверяем и корректируем временные единицы начиная с секунд и выше
         for ($level = 0; $level < 6; $level++) {
-            // Получаем текущее значение единицы времени и её максимальное значение
-            list($unit, $limit) = self::getTimeUnitAndLimit($level, $current);
+            $unitName = self::getUnitName($level);
+            $value = (int)$current->format(self::getFormatByLevel($level));
+            $criterion = $params[$unitName];
 
-            // Проверяем, соответствует ли текущее значение критерию
-            if (!self::matchCriteria($unit, $criteria[self::getUnitName($level)])) {
-                // Находим следующее подходящее значение
-                $nextValue = self::findNextValidValue($unit, $criteria[self::getUnitName($level)], $limit);
-
-                // Если нет подходящего значения, возвращаем false
-                if ($nextValue === false) {
+            // Находим следующее подходящее значение
+            $nextValue = self::findNextValidValue($value, $criterion, self::getLimitByLevel($level));
+            if ($nextValue === false) {
+                // Если следующее значение не найдено, переходим к следующему уровню
+                if ($level === 5) {
+                    // Если достигли последнего уровня (год), то нет подходящего времени
                     return false;
                 }
 
-                // Устанавливаем новое значение и сбрасываем младшие единицы времени
+                // Устанавливаем текущий уровень в 0 и переходим к следующему уровню
+                self::setTimeUnit($current, $level + 1, 0);
+                self::setTimeUnit($current, $level, 0);
+                continue;
+            }
+
+            // Если следующее значение найдено и больше текущего значения, устанавливаем его
+            if ($nextValue > $value) {
                 self::setTimeUnit($current, $level, $nextValue);
-                $level = -1; // Сбрасываем уровень, чтобы начать с секунд снова
+                // Сбрасываем меньшие единицы времени
+                for ($resetLevel = $level - 1; $resetLevel >= 0; $resetLevel--) {
+                    self::setTimeUnit($current, $resetLevel, 0);
+                }
+                break;
+            } else {
+                // Если значение не больше, то сбрасываем текущее значение и переходим к следующему уровню
+                self::setTimeUnit($current, $level, $nextValue);
+                self::setTimeUnit($current, $level + 1, 0);
+                for ($resetLevel = $level - 1; $resetLevel >= 0; $resetLevel--) {
+                    self::setTimeUnit($current, $resetLevel, 0);
+                }
             }
         }
 
-        // Возвращаем результат в нужном формате
-        return $current->format("d.m.Y H:i:s");
+        return $current->format('d.m.Y H:i:s');
     }
 
-    // Приведение параметров к полному массиву, если передан краткий вариант
-    private static function normalizeParams($params) {
-        // Стандартные значения для всех единиц времени
-        $defaultCriteria = ["sec" => "*", "min" => "*", "hour" => "*", "day" => "*", "mon" => "*", "year" => "*"];
-
-        // Если параметры заданы числовым массивом, приводим его к ассоциативному
-        if (isset($params[0])) {
-            $keys = array_keys($defaultCriteria);
-            foreach ($params as $key => $value) {
-                $defaultCriteria[$keys[$key]] = $value;
+    /**
+     * Нормализует параметры, заполняя отсутствующие значения '*'.
+     *
+     * @param array $params Исходные параметры.
+     * @return array Нормализованные параметры.
+     */
+    private static function normalizeParams($params)
+    {
+        $defaultParams = [
+            "sec" => "*",
+            "min" => "*",
+            "hour" => "*",
+            "day" => "*",
+            "mon" => "*",
+            "year" => "*"
+        ];
+        if (is_array($params) && !empty($params)) {
+            foreach ($defaultParams as $key => $value) {
+                if (!array_key_exists($key, $params)) {
+                    $params[$key] = $value;
+                }
             }
         } else {
-            // Объединяем переданные параметры с дефолтными значениями
-            $defaultCriteria = array_merge($defaultCriteria, $params);
+            $params = array_fill_keys(array_keys($defaultParams), "*");
         }
-
-        return $defaultCriteria;
+        return $params;
     }
 
-    // Функция проверки, соответствует ли текущее значение критерию
-    private static function matchCriteria($value, $criterion) {
+    /**
+     * Проверяет, соответствует ли значение критерию.
+     *
+     * @param int $value Значение.
+     * @param string $criterion Критерий.
+     * @return bool
+     */
+    private static function matchCriteria($value, $criterion)
+    {
         if ($criterion === "*") {
             return true;
         }
 
-        // Если критерий - перечисление значений, проверяем наличие текущего значения
-        if (strpos($criterion, ',') !== false) {
-            $values = explode(',', $criterion);
-            return in_array($value, $values);
+        if (preg_match('/^(\d+)-(\d+)$/', $criterion, $matches)) {
+            return $value >= $matches[1] && $value <= $matches[2];
         }
 
-        // Если критерий - диапазон значений, проверяем принадлежность диапазону
-        if (strpos($criterion, '-') !== false) {
-            list($start, $end) = explode('-', $criterion);
-            return $value >= $start && $value <= $end;
+        if (preg_match('/^(\d+(?:,\d+)*)$/', $criterion, $matches)) {
+            return in_array($value, explode(',', $matches[1]));
         }
 
-        // Если критерий - деление с остатком, проверяем выполнение условия
-        if (strpos($criterion, '/') !== false) {
-            list($mod, $divisor) = explode('/', $criterion);
-            if ($mod === '') {
-                $mod = 0;
-            }
-            return ($value % $divisor) == $mod;
+        if (preg_match('/^\/(\d+)$/', $criterion, $matches)) {
+            return $value % $matches[1] === 0;
         }
 
-        // Простое сравнение с числовым значением
-        return $value == $criterion;
+        if (preg_match('/^(\d+)\/(\d+)$/', $criterion, $matches)) {
+            return $matches[1] === "0" || $value % $matches[2] === 0;
+        }
+
+        return false;
     }
 
-    // Поиск следующего подходящего значения для текущей единицы времени
-    private static function findNextValidValue($currentValue, $criterion, $limit) {
-        if ($criterion === "*") {
-            return $currentValue;
+    /**
+     * Находит следующее подходящее значение.
+     *
+     * @param int $currentValue Текущее значение.
+     * @param string $criterion Критерий.
+     * @param int $limit Лимит.
+     * @return int|false Следующее подходящее значение или false, если не найдено.
+     */
+    private static function findNextValidValue($currentValue, $criterion, $limit)
+    {
+        for ($i = $currentValue + 1; $i <= $limit; $i++) {
+            if (self::matchCriteria($i, $criterion)) {
+                return $i;
+            }
         }
-
-        // Обработка перечислений значений
-        if (strpos($criterion, ',') !== false) {
-            $values = array_map('intval', explode(',', $criterion));
-            foreach ($values as $value) {
-                if ($value > $currentValue) {
-                    return $value;
-                }
-            }
-            return $values[0]; // Если не нашли большее значение, возвращаем первое
-        }
-
-        // Обработка диапазона значений
-        if (strpos($criterion, '-') !== false) {
-            list($start, $end) = explode('-', $criterion);
-            if ($currentValue < $start) {
-                return $start;
-            }
-            if ($currentValue >= $end) {
-                return false; // Если вышли за пределы диапазона, возвращаем false
-            }
-            return $currentValue + 1;
-        }
-
-        // Обработка деления с остатком
-        if (strpos($criterion, '/') !== false) {
-            list($mod, $divisor) = explode('/', $criterion);
-            if ($mod === '') {
-                $mod = 0;
-            }
-            for ($i = $currentValue + 1; $i <= $limit; $i++) {
-                if ($i % $divisor == $mod) {
-                    return $i;
-                }
-            }
-            return false; // Если не нашли подходящее значение, возвращаем false
-        }
-
-        // Проверяем простое числовое значение
-        return $currentValue < $criterion ? $criterion : false;
+        return false;
     }
 
-    // Получение текущего значения единицы времени и его лимита
-    private static function getTimeUnitAndLimit($level, $current) {
+    /**
+     * Устанавливает значение для единицы времени.
+     *
+     * @param DateTime $current Текущее время.
+     * @param int $level Уровень единицы времени.
+     * @param int $value Новое значение.
+     */
+    private static function setTimeUnit(&$current, $level, $value)
+    {
         switch ($level) {
-            case 0: return [(int)$current->format('s'), 59];  // Секунды
-            case 1: return [(int)$current->format('i'), 59];  // Минуты
-            case 2: return [(int)$current->format('H'), 23];  // Часы
-            case 3: return [(int)$current->format('d'), (int)$current->format('t')];  // Дни (учитывается количество дней в месяце)
-            case 4: return [(int)$current->format('m'), 12];  // Месяцы
-            case 5: return [(int)$current->format('Y'), 9999];  // Годы
+            case 0: // секунды
+                $current->setTime($current->format('H'), $current->format('i'), $value);
+                break;
+            case 1: // минуты
+                $current->setTime($current->format('H'), $value, $current->format('s'));
+                break;
+            case 2: // часы
+                $current->setTime($value, $current->format('i'), $current->format('s'));
+                break;
+            case 3: // дни
+                $current->setDate($current->format('Y'), $current->format('n'), $value);
+                break;
+            case 4: // месяцы
+                $current->setDate($current->format('Y'), $value, $current->format('j'));
+                break;
+            case 5: // годы
+                $current->setDate($value, $current->format('n'), $current->format('j'));
+                break;
         }
-        return [0, 0]; // Невалидный случай, просто возвращаем 0, 0
     }
 
-    // Установка нового значения для текущей единицы времени и сброс младших единиц
-    private static function setTimeUnit(&$current, $level, $value) {
-        switch ($level) {
-            case 0: $current->setTime($current->format('H'), $current->format('i'), $value); break; // Устанавливаем секунды
-            case 1: $current->setTime($current->format('H'), $value, 0); break; // Устанавливаем минуты и сбрасываем секунды
-            case 2: $current->setTime($value, 0, 0); break; // Устанавливаем часы и сбрасываем минуты и секунды
-            case 3: $current->setDate($current->format('Y'), $current->format('m'), $value); break; // Устанавливаем день месяца
-            case 4: $current->setDate($current->format('Y'), $value, 1); break; // Устанавливаем месяц и сбрасываем день
-            case 5: $current->setDate($value, 1, 1); break; // Устанавливаем год и сбрасываем месяц и день
-        }
+    /**
+     * Получает имя единицы времени по уровню.
+     *
+     * @param int $level Уровень.
+     * @return string Имя единицы времени.
+     */
+    private static function getUnitName($level)
+    {
+        $units = ['sec', 'min', 'hour', 'day', 'mon', 'year'];
+        return $units[$level];
     }
 
-    // Получение названия единицы времени по её уровню
-    private static function getUnitName($level) {
-        return ['sec', 'min', 'hour', 'day', 'mon', 'year'][$level];
+    /**
+     * Получает лимит единицы времени по уровню.
+     *
+     * @param int $level Уровень.
+     * @return int Лимит.
+     */
+    private static function getLimitByLevel($level)
+    {
+        $limits = [59, 59, 23, 31, 12, 9999];
+        return $limits[$level];
+    }
+
+    /**
+     * Получает формат для единицы времени по уровню.
+     *
+     * @param int $level Уровень.
+     * @return string Формат.
+     */
+    private static function getFormatByLevel($level)
+    {
+        $formats = ['s', 'i', 'H', 'j', 'n', 'Y'];
+        return $formats[$level];
     }
 }
